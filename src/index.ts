@@ -206,22 +206,30 @@ export function createAgent(
   cache: ICacheManager,
   token: string
 ) {
+  if (!character || !character.name) {
+    throw new Error('Character configuration is required');
+  }
+
   elizaLogger.success(
     elizaLogger.successesTitle,
     "Creating runtime for character",
     character.name
   );
+
+  // Skip browser plugin if DISABLE_BROWSER is set
+  const plugins = [
+    bootstrapPlugin,
+    process.env.DISABLE_BROWSER ? null : nodePlugin,
+    character.settings?.secrets?.WALLET_PUBLIC_KEY ? solanaPlugin : null,
+  ].filter(Boolean);
+
   return new AgentRuntime({
     databaseAdapter: db,
     token,
-    modelProvider: character.modelProvider,
+    modelProvider: character.modelProvider || ModelProviderName.OPENAI,
     evaluators: [],
     character,
-    plugins: [
-      bootstrapPlugin,
-      nodePlugin,
-      character.settings.secrets?.WALLET_PUBLIC_KEY ? solanaPlugin : null,
-    ].filter(Boolean),
+    plugins,
     providers: [],
     actions: [],
     services: [],
@@ -244,72 +252,103 @@ function intializeDbCache(character: Character, db: IDatabaseCacheAdapter) {
 
 async function startAgent(character: Character, directClient: DirectClient) {
   try {
+    if (!character || !character.name) {
+      throw new Error('Invalid character configuration');
+    }
+
+    if (!directClient) {
+      throw new Error('DirectClient is required');
+    }
+
+    console.log('Starting agent with character:', {
+      name: character.name,
+      id: character.id,
+      modelProvider: character.modelProvider
+    });
+
     character.id ??= stringToUuid(character.name);
     character.username ??= character.name;
 
     const token = getTokenForProvider(character.modelProvider, character);
-    const dataDir = path.join(__dirname, "../data");
+    if (!token) {
+      throw new Error(`No API token found for provider ${character.modelProvider}`);
+    }
 
+    const dataDir = path.join(__dirname, "../data");
     if (!fs.existsSync(dataDir)) {
       fs.mkdirSync(dataDir, { recursive: true });
     }
 
     const db = initializeDatabase(dataDir);
-
     await db.init();
 
     const cache = intializeDbCache(character, db);
     const runtime = createAgent(character, db, cache, token);
 
     await runtime.initialize();
-
     const clients = await initializeClients(character, runtime);
-
     directClient.registerAgent(runtime);
 
     return clients;
   } catch (error) {
-    elizaLogger.error(
-      `Error starting agent for character ${character.name}:`,
-      error
-    );
-    console.error(error);
+    elizaLogger.error(`Error starting agent for character ${character?.name}:`, error);
+    console.error('Full error details:', error);
     throw error;
   }
 }
 
 const startAgents = async () => {
-  const directClient = await DirectClientInterface.start();
-  const args = parseArguments();
-
-  let charactersArg = args.characters || args.character;
-
-  let characters = [character];
-  console.log("charactersArg", charactersArg);
-  if (charactersArg) {
-    characters = await loadCharacters(charactersArg);
-  }
-  console.log("characters", characters);
   try {
-    for (const character of characters) {
-      await startAgent(character, directClient as DirectClient);
+    // Disable browser service if Playwright isn't installed
+    process.env.DISABLE_BROWSER = 'true';
+    
+    const directClient = await DirectClientInterface.start();
+    if (!directClient) {
+      throw new Error('Failed to initialize DirectClientInterface');
     }
-  } catch (error) {
-    elizaLogger.error("Error starting agents:", error);
-  }
 
-  function chat() {
-    const agentId = characters[0].name ?? "Agent";
-    rl.question("You: ", async (input) => {
-      await handleUserInput(input, agentId);
-      if (input.toLowerCase() !== "exit") {
-        chat(); // Loop back to ask another question
-      }
+    const args = parseArguments();
+    let charactersArg = args.characters || args.character;
+
+    let characters = [character];
+    console.log("Starting with characters:", {
+      charactersArg,
+      defaultCharacter: character.name
     });
-  }
 
-  elizaLogger.log("Chat started. Type 'exit' to quit.");
-  chat();
+    if (charactersArg) {
+      characters = await loadCharacters(charactersArg);
+    }
+
+    if (!characters || characters.length === 0) {
+      throw new Error('No valid characters to start');
+    }
+
+    for (const char of characters) {
+      console.log(`Starting agent for character: ${char.name}`);
+      await startAgent(char, directClient as DirectClient);
+    }
+
+    function chat() {
+      const agentId = characters[0].name ?? "Agent";
+      rl.question("You: ", async (input) => {
+        await handleUserInput(input, agentId);
+        if (input.toLowerCase() !== "exit") {
+          chat();
+        }
+      });
+    }
+
+    elizaLogger.log("Chat started. Type 'exit' to quit.");
+    chat();
+
+  } catch (error) {
+    elizaLogger.error("Error starting agents:", {
+      error: error.message,
+      stack: error.stack
+    });
+    process.exit(1);
+  }
 };
 
 startAgents().catch((error) => {
